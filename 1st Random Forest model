@@ -1,0 +1,105 @@
+#######################################
+######    KAGGLE FUTURE SALES    ######
+#######################################
+library(tidyverse)
+library(lubridate)
+library(ranger)
+
+## basics:
+getwd()
+setwd("C:/Users/benedikt.kreutzer/Desktop/KAGGLE")
+
+shops <- read_csv("shops.csv")
+items <- read_csv("items.csv")
+cates <- read_csv("item_categories.csv")
+sales_train <- read_csv("sales_train_v2.csv")
+cats_transl <- read_csv("item_categories_translated.csv")
+shops_transl <- read_csv("shops_translated.csv")
+testdaten <- read_csv("test.csv")
+pred_daten <- read_csv("sample_submission.csv")
+
+## Übersetzer JOIN  ---- das sind also 60 Shops
+shops_2 <- shops %>%
+  inner_join(shops_transl, by="shop_id") %>%
+  select(-1)
+
+cats <- cates %>%     ##### ---- und 84 Kategorien
+  inner_join(cats_transl, by="item_category_id") %>%
+  select(-1)
+
+## Items mit Kategorien verjoinen... und dann noch die Seller-Information dran:
+it_2 <- items %>%
+  inner_join(cats, by="item_category_id") %>%
+  select(-1)
+
+st_2 <- sales_train %>%
+  inner_join(it_2, by="item_id" )
+
+
+## Datenaufbereitung: Date zerlegen, date_block_num raus...
+monate <- data.frame( monat = paste0(LETTERS[1:12], LETTERS[1:12]),
+                      zahl = 1:12)
+
+st_3 <- st_2 %>% mutate(month = as.numeric(format(dmy(date), format = "%m")),
+                        year = as.numeric(format(dmy(date), format = "%Y"))) %>% 
+  select(-date_block_num, -date)
+
+st_3 %>% head()
+
+
+## ...und noch in Test-Train teilen...
+
+## Testdaten-Shops und -Items rauskicken...
+test_shops <- testdaten %>% 
+  select(shop_id) %>% distinct()
+
+test_items <- testdaten %>% 
+  select(item_id) %>% distinct()
+
+st_4 <- st_3 %>% 
+  inner_join(test_shops, by = c("shop_id" = "shop_id")) %>% 
+  inner_join(test_items, by = c("item_id" = "item_id"))
+
+
+## ...und dann predicten!
+#trainierer <- ranger(item_cnt_day ~ ., data = st_4, 
+#                     num.threads = 6, num.trees = 500)
+#trainierer
+#
+#trainierer_2 <- ranger(item_cnt_day ~ ., data = st_4, 
+#                     num.threads = 6, num.trees = 500)
+#trainierer_2
+
+
+## hier ziehe ich den Preis ab - der ist ja variabel und nicht in den Testdaten!
+trainierer_3 <- ranger(item_cnt_day ~ ., data = ( st_4 %>% select(-item_price) ), 
+                       num.threads = 6, num.trees = 250)
+trainierer_3 ## puuuh, diese OOB...
+
+## Average item price per shop maybe?
+
+## Vorhersagedaten müssen noch ihr Date getrennt haben
+cats_transl
+shops_transl 
+testdaten 
+
+pred_2 <- pred_daten %>% 
+  inner_join(testdaten, by="ID") %>% 
+  inner_join(shops_transl, by="shop_id") %>% 
+  inner_join(it_2, by="item_id") %>% 
+  mutate(month = 11, 
+         year = 2015, 
+         item_cnt_month = NA)
+
+st_4 %>% names()
+pred_2 %>% names() ## keine Unterschiede - passt!
+
+hans_wurst <- predict(trainierer_3, pred_2)
+
+pred_2$item_cnt_month <- hans_wurst$predictions
+
+## selecten und abspeichern
+final_sub <- pred_2 %>% 
+  select(ID, item_cnt_month)
+
+write_csv(final_sub, "third_submission.csv")
