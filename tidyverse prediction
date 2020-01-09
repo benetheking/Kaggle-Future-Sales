@@ -1,0 +1,271 @@
+# %% [code]
+# Load libraries
+library(tidyverse)
+library(lubridate)
+library(data.table)
+library(ggplot2)
+library(xgboost)
+library(ranger)
+
+## Data import:
+## list.files(path = "../input", recursive = TRUE)
+getwd()
+setwd("C:/Users/benedikt.kreutzer/Desktop/KAGGLE")
+
+shops <- read_csv("shops.csv")
+items <- read_csv("items.csv") 
+cats <- read_csv("item_categories.csv")
+sales_train <- read_csv("sales_train_v2.csv")
+cats_transl <- read_csv("item_categories_translated.csv")
+shops_transl <- read_csv("shops_translated.csv")
+testdaten <- read_csv("test.csv")
+pred_daten <- read_csv("sample_submission.csv")
+## dieses Daten-Einladen ist hier nötig, sollte aber mal durch obigen auskommentierte  Code ersetzt werden.
+
+##
+## hier die Funktions-Definition....
+lag_merger = function(df, colname, shift_by, na_replace = 0) {
+# Takes a column and re-merges it onto a df, shifted by a given lag.
+# df:              data table where one column should be shifted
+# column_name:     name of the column which should be shifted
+# shift_by:        vector of length one denoting the number of months the
+#                  column should be shifted by
+# na_replace:      denotes the value NAs should be replaced by after shifting.
+#                  If set to NULL, no replacement is done, NAs are kept
+
+if (length(shift_by) > 1) stop("Only one shift can be supplied")
+if (shift_by < 1) stop("The shift has to be positive")
+if (round(shift_by) != shift_by) stop("The shift has to be integer")
+if (colname %nin% names(df)) stop("Column name has to a valid name in df")
+
+newcolname = paste0(colname, "_lag", shift_by)
+
+df = merge(df, df[, .(shop_id, item_id, calmonth_num = calmonth_num + shift_by,
+                      placeholder = get(colname))],
+           by = c("shop_id", "item_id", "calmonth_num"),
+           all.x = TRUE, all.y = FALSE, sort = FALSE)
+names(df)[names(df) == "placeholder"] = newcolname
+if (!is.null(na_replace)) {
+  df[[newcolname]][is.na(df[[newcolname]])] = na_replace
+  }
+return(df)
+}
+
+lag_merger_td = function(df, colname, shift_by, na_replace = 0) {
+
+  if (length(shift_by) > 1) stop("Only one shift can be supplied")
+  if (shift_by < 1) stop("Shift must be positive")
+  if (round(shift_by) != shift_by) stop("The shift has to be integer")
+  if (colname %nin% names(df)) stop("Column name must valid name in df")
+  
+  newcolname = paste0(colname, "_lag", shift_by)
+  
+  df = merge(df, df[, .(shop_id, item_id, calmonth_num = calmonth_num + shift_by,
+                        placeholder = get(column_name))],
+             by = c("shop_id", "item_id", "calmonth_num"),
+             all.x = TRUE, all.y = FALSE, sort = FALSE)
+
+    names(df)[names(df) == "placeholder"] = newcolname
+
+      if (!is.null(na_replace)) {
+    df[[newcolname]][is.na(df[[newcolname]])] = na_replace
+    }
+  return(df)
+}
+## ersmal - Sales Data einlesen
+sales_train
+
+sales_2 <- sales_train %>% 
+  select(-date_block_num) %>% 
+  mutate(date = dmy(date)) 
+
+## define table with date, cal_week and months - and use strings because that will make it categorical
+datevek = seq(from = min(sales_2$date) - 7,
+              to = max(sales_2$date) + 7, by = 1 )
+
+week_month <- tibble(date = datevek,
+                     calweek = make_calweek(datevek),
+                     calmonth = make_calmonth(datevek) ) %>% 
+  filter(date > "2013-01-01") %>% 
+  mutate(calmonth_num = as.integer(factor(calmonth) ) ) %>% 
+## hier könnte man noch einfach 1-12 als Monate machen...oder auch Jahr-Monat getrennt....
+## MACHE ICH HIER AUCH EINFACH! - kommt raus, wenn es keine Verbesserung erzielt...
+  mutate(monthy_python = str_sub(calmonth, 5, 6 ) ,
+         yearly = str_sub(calmonth, 1, 4 ) ) 
+
+## verjoinen tun muss man aber doch!
+sales_3 <- sales_2 %>% 
+  inner_join(week_month, by="date")
+
+## jetzt die Item-Datas...
+it_2 <- items %>% 
+  select(-item_name) %>%  # we don't need that column, it's just moon language strings
+  inner_join(cats_transl, by="item_category_id")
+
+soviet_cats <- cats %>% 
+  mutate(type = (str_split(item_category_name, " - ") %>%   ## this was just a wild idea to extract the 1st str_split element
+                   map(.x=., ~`[`(.x, 1) ) ),               ## honestly though I have no idea how that actually works LOL
+         subtype = (str_split(item_category_name, " - ") %>% 
+                      map(.x=., ~`[`(.x, 2) ) )) %>%           
+  unnest( c(type, subtype) ) %>%                            ## also I have no idea why map would put this in a list element
+  mutate(subtype = coalesce(subtype, type) ) %>%            ## have to get rid of the NAs here
+  mutate(type_code = as.integer(factor(type) ),
+         subtype_code = as.integer(factor(subtype) ) ) %>%  
+  select(-item_category_name)                               ## additional coded columns 
+
+soviet_cats ## looking good!
+
+## now merge with item_data:
+it_3 <- it_2 %>% 
+  inner_join(soviet_cats, by="item_category_id")
+
+shops
+shops_transl ## these are identical!
+
+## Adapt Shop data:
+sales_4 <- sales_3 %>% 
+  mutate(shop_id = case_when(shop_id == 1 ~ 58,
+                              shop_id == 11 ~ 10,
+                              shop_id == 0 ~ 57,
+                              TRUE ~ shop_id))
+## I should note that I'm always a little anxious when mutating a variable with a direct call to that variable
+## the alternative would be to mutate(var2 ~ var1) %>% select(-var1) %>% select(var1=var2), which is very unelegant 
+
+## let's work on the shop data a bit!
+## THIS COULD STILL BE OPTIMIZED MANUALLY!
+shops_2 <-  shops_transl %>% 
+  mutate(shop_name = case_when( shop_name == "Zhukovsky str. Chkalova 39mÂ²"    ~ "Zhukovsky str. Chkalova 39m",
+                                shop_name == "Zhukovsky str. Chkalova 39m?"     ~ "Zhukovsky str. Chkalova 39m",
+                                shop_name == "! Yakutsk shopping mall Central franc" ~ "Yakutsk Central shopping mall",
+                                shop_name == "Yakutsk shopping mall Central"         ~ "Yakutsk Central shopping mall",
+                                shop_name == "Yakutsk Ordzhonikidze, 56 francs."         ~ "Yakutsk Ordzhonikidze, 56",
+                                shop_name == "shiYakutsk Ordzhonikidze, 56"              ~ "Yakutsk Ordzhonikidze, 56",
+                                TRUE ~ shop_name ) ) %>% 
+  filter(shop_name %nin% c("Moscow Sale", "Outbound Trade")) %>% 
+  mutate(shop_name = str_replace(shop_name, "Shopping and Entertainment", "SaE"))
+
+shops_2[16, 1] <- "Kolomna TC Rio"
+
+shops_3 <- shops_2 %>% 
+  mutate(city = (strsplit(shop_name, " ") %>% map(., ~`[`(., 1) ) ) ) %>% 
+  unnest(city)
+
+shops_3[49:50, 3] <- "Tyumen"
+shops_3[33, 3] <- "Novgorod"
+shops_3[41:42, 3] <- "St. Petersburg"
+shops_3[c(12, 54), 3] <- "Online"
+
+shops_4 <- shops_3 %>% 
+  mutate(city_code = as.integer(factor(city) ) ,
+         onlineshop = case_when( grepl("nline", city) ~ 1,
+                                 TRUE ~ 0 ) )
+
+sales_5 <- sales_4 %>% 
+  inner_join(shops_4, by="shop_id") %>%
+  inner_join(it_3, by="item_id")
+
+## ALTERNATIVE - should I rather go for a left join here? There's a small difference in the result set!
+sales_6 <- sales_4 %>% 
+  left_join(shops_4, by="shop_id") %>% 
+  left_join(it_3, by="item_id")
+
+test_2 <- testdaten %>% 
+  inner_join(shops_4, by="shop_id")
+
+#######
+threshold_sales_removal = 1000    # any observation in tach larger than that gets removed
+threshold_price_removal = 50000   # any obersation with a price higher gets removed
+impute_negative_price = TRUE  
+#######
+
+## Clean data:
+sales_6 <- sales_5 %>% 
+  filter(item_cnt_day <= threshold_sales_removal,
+         item_price <= threshold_price_removal) 
+
+sales_6[sales_6$item_price < 0, "item_price"] <- median(sales_6$item_price)
+
+sales_6
+
+
+# Create a table that holds for each calendar month, shop-ID and item-ID combination the 
+# monthly sales (label) and features.
+
+## in anderen Worten- einfach aufaggregieren...
+
+## ist jetzt natürlich dumm, dass wir all die Variablen kreiert haben - jetzt muss ich nach all denen Gruppieren....
+
+trainer <- sales_6 %>% 
+  group_by(shop_id, item_id, item_price, calweek, calmonth, calmonth_num, monthy_python,
+           yearly, shop_name, city, city_code, onlineshop, item_category_id, item_category_name,
+           supercategory, type, subtype, type_code, subtype_code) %>% 
+  summarize(item_cnt_month = sum(item_cnt_day))
+
+## wow this is like super inefficient! 
+
+## JOIN mit Test-Table
+train_2 <- trainer %>% 
+  ungroup() %>% 
+  mutate(item_cnt_month = case_when(item_cnt_month < 0 ~ 0,
+                                                  TRUE ~ item_cnt_month) )
+  
+train_2  
+
+test_2
+
+
+
+  
+  
+  
+  
+
+
+
+
+
+#####################################
+###### ab hier - Pulsar data!
+
+pp <- read_csv("pulsar_data.csv", col_names = F)
+
+pp$X9 %>% table() ## das ist die AV!
+
+pp2 <- pp %>%       ## kurz noch umbenennen...
+  select(9, 1:8) %>% 
+  set_names("Pulsi", "V1", "V2", "V3", "V4", "V5", "V6", "V7",  "V8") 
+
+pp2 %>% 
+  gather(key="keykey", value="val", -Pulsi) %>% 
+  filter(val < 200) %>% 
+#  ggplot(aes(x=val, col=keykey)) + geom_density()
+  ggplot(aes(x=val, y=Pulsi, col=keykey)) + geom_point()
+  
+## v1 - als Reg-Objekt
+raf <- ranger(Pulsi ~ ., data=pp2, importance="impurity")
+
+raf$variable.importance
+
+plot(importance(raf))
+
+## v2 - mit Factors und CLASS
+pp3 <- pp2 %>% 
+  mutate(Pulsi = as_factor(Pulsi))
+
+raf_2 <- ranger(Pulsi ~ ., data=pp3, splitrule = "gini")
+
+
+raf_2$predictions %>% table()
+
+if_else(raf$predictions > 0.5, 1, 0) %>% table()
+
+
+
+
+
+
+
+
+
+
+
